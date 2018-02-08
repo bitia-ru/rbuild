@@ -1,0 +1,92 @@
+#!/bin/env python3.3
+
+from datetime import datetime
+from sys import stderr, argv
+from pprint import pprint
+from os import environ
+
+from sys import exc_info
+from traceback import print_exception as print_exc
+
+from rbuild.args import base_parser
+from rbuild.pkgdep import PackageDep
+from rbuild.ui import *
+from rbuild.ui import pkgname2str
+from rbuild.wrapper import wrapper
+from rbuild.project import Project
+
+
+def parse_args():
+  p = base_parser()
+ 
+  p.add_argument('packages', action='store', type=str, nargs='*')
+ 
+  cfg = p.parse_args()
+ 
+  return cfg
+
+
+def main(prj, **args):
+  tasklist = PackageDep.parse2tasks(prj, None, prj.phases[args['phase']] if 'phase' in args else prj.phase_defs['phase'], ' '.join(args['packages']))
+
+  for task in tasklist:
+    t = task.phase.reqsdeps_all
+    t.add(task.phase)
+    print('%s:' % pkgname2str(task.pkg.pkgname), file=info)
+    print('\t\tIUSEs: %s' % ','.join(task.pkg.iuses()), file=info)
+    print('\t\tUSEs: %s' % ','.join(task.pkg.uses()), file=info)
+    for s in t:
+      print('\t\t%(phase)s(%(state)s) -> deps=[%(deps)s], reqs=[%(reqs)s]' % {
+        'phase': str(s),
+        'deps': ', '.join([ '%s::%s' % (pkgname2str(t.pkg.pkgname), str(t.phase)) for t in task.pkg.deps(s) ]),
+        'reqs': ', '.join([ '%s::%s' % (pkgname2str(t.pkg.pkgname), str(t.phase)) for t in task.pkg.reqs(s) ]),
+        'state': ( '%s, %s' % (prj.task(task.pkg, s).is_done(), prj.task(task.pkg, s).is_outdated())),
+      }, file=info)
+    print('', file=info)
+    if not task.pkg.dummy:
+      for s in [ s for sname,s in prj.phases.items() if s.outdated_func ]:
+        print('\t\t%(phase)s:%(func)s=%(state)s' % {
+          'phase': str(s),
+          'func': str(s.outdated_func),
+          'state': task.pkg.is_outdated(s),
+        }, file=info)
+      print('', file=info)
+
+  return 0
+
+
+def premain(**args):
+  ui = args['ui']
+
+  print('\n\n\nrbq started at %s' % datetime.now(), file=ui.dbglog)
+  print('Arguments: %s' % str(argv), file=ui.dbglog)
+  print('Environment:', file=ui.dbglog)
+  pprint(dict(environ), stream=ui.dbglog)
+  ui.flush()
+
+  with Project(**args) as prj:
+    prj.load_config()
+    retval = main(prj, **args)
+    print('', file=ui.info)
+
+  return retval
+
+
+if __name__ == '__main__':
+  try:
+    args = parse_args()
+  except SystemExit:
+    exit(0)
+  except:
+    print_exc(*exc_info(), file=stderr)
+    print('Internal error through parsing arguments', file=stderr)
+    exit(1)
+
+  if args.version:
+    print('%s %s (%s)' % (version['name'], version['version'], version['revision']))
+    exit(0)
+
+  args.rbuild = __file__
+
+  exit(wrapper(premain, **{ k: v for k,v in vars(args).items() if v is not None}))
+

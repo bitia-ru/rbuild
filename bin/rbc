@@ -1,0 +1,140 @@
+#!/bin/env python3.3
+
+from datetime import datetime
+from sys import stdout,stderr,argv
+from pprint import pprint
+from os import environ
+from time import time
+
+from sys import exc_info
+from traceback import print_exception as print_exc
+
+from rbuild.args import base_parser
+from rbuild.pkgdep import PackageDep
+from rbuild.ui import *
+from rbuild.ui import pkgname2str
+from rbuild.project import Project
+
+
+def worker_loadenv(roottask, a=[]):
+  rel = []
+
+  if roottask in a:
+    return True
+
+  def compose(root, rel):
+    r = root.reqs() + root.deps()
+    for task in r:
+      if task.pkg.dummy:
+        compose(task, rel)
+      else:
+        if task.pkg == roottask.pkg:
+          rel.append(task)
+        else:
+          rel.insert(0, task)
+
+  compose(roottask, rel)
+
+  for task in rel:
+    if not worker_loadenv(task, a):
+      return False
+
+  roottask.pkg.load_env()
+
+  a.append(roottask)
+
+  return True
+
+def parse_args():
+  p = base_parser()
+ 
+  p.add_argument('package', action='store', type=str, nargs=1)
+
+  p.add_argument('-C', dest='command', type=str)
+  p.add_argument('--file', dest='script', type=str)
+
+  p.add_argument('-p', '--phase', dest='phase', type=str, default='build', help='phase for execution')
+ 
+  cfg = p.parse_args()
+ 
+  return cfg
+
+
+def main(prj, **args):
+  print('Loading config...', file=info)
+  prj.load_config()
+
+  pkg = prj.find_pkg(args['package'][0])
+
+  script = None
+
+  if 'command' in args:
+    script = args['command']
+  elif 'script' in args:
+    script = open(args['script']).read()
+  else:
+    raise RBuildError('-C or -f shall be passed')
+
+  if args['phase'] not in prj.phases:
+    print("Unknown phase '%s'" % args['phase'], file=ui.err)
+    return 1
+
+  phase = prj.phases[args['phase']]
+
+  worker_loadenv(prj.task(pkg, phase))
+
+  with prj.libsrv.in_pkg(pkg.pkgname, phase):
+    return pkg.exec(script, scname='userfunc', save_sc=True, phase=str(phase))
+
+
+def premain(**args):
+  ui = args['ui']
+
+  print('\n\n\nrbc started at %s' % datetime.now(), file=ui.dbglog)
+  print('Arguments: %s' % str(argv), file=ui.dbglog)
+  print('Environment:', file=ui.dbglog)
+  pprint(dict(environ), stream=ui.dbglog)
+  ui.flush()
+
+  with Project(**args) as prj:
+    retval = main(prj, **args)
+    print('', file=ui.info)
+
+  return retval
+
+class UI:
+  def __init__(self):
+    devnull = open("/dev/null", "w")
+    self.disp    = stdout
+    self.info    = devnull
+    self.warn    = stderr
+    self.err     = stderr
+    self.dbg     = stderr
+    self.dbglog  = devnull 
+    self.syswarn = stderr
+    self.syserr  = stderr
+    self.sysdbg  = devnull
+
+  def flush(self):
+    pass
+
+
+if __name__ == '__main__':
+  try:
+    args = parse_args()
+  except SystemExit:
+    exit(0)
+  except:
+    print_exc(*exc_info(), file=stderr)
+    print('Internal error through parsing arguments', file=stderr)
+    exit(1)
+
+  if args.version:
+    print('%s %s (%s)' % (version['name'], version['version'], version['revision']))
+    exit(0)
+
+  args.rbuild = __file__
+  args.ui = UI()
+
+  exit(premain(**{ k: v for k,v in vars(args).items() if v is not None}))
+

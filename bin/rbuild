@@ -1,0 +1,194 @@
+#!/bin/env python3.3
+
+from sys import stderr, argv
+from os import environ
+from time import time
+from datetime import datetime
+from pprint import pprint
+
+from sys import exc_info
+from traceback import print_exception as print_exc
+
+from rbuild.wrapper import wrapper
+from rbuild.args import base_parser
+from rbuild.version import version
+from rbuild.project import Project
+from rbuild.package import Package
+from rbuild.pkgname import PackageName
+from rbuild.pkgdep import PackageDep
+from rbuild.graph import dfs
+from rbuild.phase import Phase
+from rbuild.ui import *
+from rbuild.ui import pkgname2str
+from rbuild.misc import Path
+from rbuild.err import *
+
+
+def parse_args():
+  p = base_parser()
+ 
+  p.add_argument('-p', '--prjroot', dest='root', metavar='path', type=str, help='set directory path for distfiles (default: %(default)s)')
+  p.add_argument('--phase', dest='phase', type=str, default=None, help='set target phase')
+  p.add_argument('--ignore-outdated', action='store_true', help='Ignore \'outdated\' field of packages', default=False, dest='ignore-outdated')
+ 
+  p.add_argument('packages', action='store', type=str, nargs='*')
+  #p.add_argument('-T', action='store_true', help='Print plan tree', dest='plan_tree')
+  p.add_argument('--no-deps', action='store_false', help='Ignore dependencies', default=None, dest='deps')
+  p.add_argument('--no-phase-deps', action='store_false', help='Ignore phase dependencies', default=None, dest='phasedeps')
+  p.add_argument('--deps', action='store_true', help='Force build dependencies', default=None, dest='deps')
+ 
+  cfg = p.parse_args()
+ 
+  return cfg
+
+
+def worker_dryrun(roottask, builded, ignored, starttime, force, extdeps, check_outdated):
+  rel = []
+
+  if roottask.is_done() > starttime or roottask in ignored:
+    return True
+
+  def compose(root, rel):
+    r = root.reqs(extdeps)
+    for task in r:
+      if task.pkg.dummy:
+        compose(task, rel)
+      else:
+        if task.pkg == roottask.pkg:
+          rel.append(task)
+        else:
+          rel.insert(0, task)
+
+  compose(roottask, rel)
+
+  for task in rel:
+    if not worker_dryrun(task, builded, ignored, starttime, force, extdeps, check_outdated):
+      return False
+
+  if roottask.pkg.dummy:
+    ignored.append(roottask)
+    return True
+
+  outdated_checker = lambda t: t.is_outdated() if ( check_outdated and extdeps ) else False
+  isdone_checker = lambda t: t.is_done() if not force else False
+
+  if not ( not isdone_checker(roottask) or ( isdone_checker(roottask) < starttime and outdated_checker(roottask) ) ):
+    ignored.append(roottask)
+    return True
+
+  roottask.do(dryrun=True)
+  builded(roottask)
+
+  return True
+
+
+def compose_plan(prj, tasklist, tasklist_forplan, **args):
+  tasklist_args = PackageDep.parse2tasks(prj, None, prj.phases[args['phase']] if 'phase' in args else prj.phase_defs['phase'], ' '.join(args.get('packages', [])))
+
+  check_outdated = not args.get('ignore-outdated', False)
+
+  if args.get('phasedeps', True) != False:
+    [ worker_dryrun(task, lambda t: tasklist.append(t), [], float(time()), args.get('force', True), args.get('deps', True), check_outdated) for task in tasklist_args ]
+  
+    for t in tasklist:
+      if tasklist_forplan:
+        if tasklist_forplan[-1].pkg == t.pkg and Phase.comparable(tasklist_forplan[-1].phase, t.phase):
+          if t.phase > tasklist_forplan[-1].phase:
+            tasklist_forplan[-1] = t
+            continue
+      tasklist_forplan.append(t)
+  else:
+    [ tasklist.append(t) for t in tasklist_args ]
+    [ tasklist_forplan.append(t) for t in tasklist ]
+
+
+def mainloop(prj, tasklist, **args):
+  pkgs_all = len(set([ t.pkg for t in tasklist ]))
+  builded_pkgs = 0
+
+  res = True
+
+  for i,task in enumerate(tasklist):
+    with msg(info, bold('Building %s.%s...' % (pkgname2str(task.pkg.pkgname), task.phase))):
+      title('Building %s.%s... (%d of %d)' % (task.pkg.pkgname, task.phase, builded_pkgs+1, pkgs_all))
+
+      res = task.do()
+
+    if not res:
+      print('%s.%s failed' % (str(task.pkg.pkgname), task.phase), file=err)
+      break
+    
+    print('%s.%s done' % (str(task.pkg.pkgname), task.phase), file=dbg)
+
+    ui.flush()
+
+    if task.pkg not in ( t.pkg for t in tasklist[i+1:] ):
+      builded_pkgs += 1
+
+  return 0 if res == True else 1
+
+
+def main(**args):
+  ui = args['ui']
+
+  print('\n\n\nrbuild started at %s' % datetime.now(), file=ui.dbglog)
+  print('Arguments: %s' % str(argv), file=ui.dbglog)
+  print('Environment:', file=ui.dbglog)
+  pprint(dict(environ), stream=ui.dbglog)
+  ui.flush()
+
+  tasklist = []
+  tasklist_forplan = []
+
+  print('Composing work plan...', file=info)
+
+  with Project(**args) as prj:
+    prj.load_config()
+    compose_plan(prj, tasklist, tasklist_forplan, **args)
+    print('', file=ui.info)
+
+  print('', file=info)
+
+  if not tasklist:
+    print('Nothing to be done!\n', file=info)
+    return 0
+
+  with msg(info, 'Build plan:'):
+    [ print(task.str(), file=sysdbg) for task in tasklist ]
+    ui.flush()
+    [ print(task.str(), file=info) for task in tasklist_forplan ]
+  print('', file=info, end='\n\n')
+
+  if args.get('ask', False):
+    need = ask('Would you like to build these packages?', 'yesno')
+    if not need: return 0
+
+  print(bold('Processing packages...'), file=info)
+
+  with Project(**args) as prj:
+    prj.load_config()
+    tasklist = [ prj.task(prj.pkg(t.pkg.pkgname), t.phase) for t in tasklist ]
+    retval = mainloop(prj, tasklist, **args)
+    print('', file=ui.info)
+
+  return retval
+
+
+if __name__ == '__main__':
+  try:
+    args = parse_args()
+  except SystemExit:
+    exit(0)
+  except:
+    print_exc(*exc_info(), file=stderr)
+    print('Internal error through parsing arguments asdf', file=stderr)
+    exit(1)
+
+  if args.version:
+    print('%s %s (%s)' % (version['name'], version['version'], version['revision']))
+    exit(0)
+
+  args.rbuild = __file__
+
+  exit(wrapper(main, **{ k: v for k,v in vars(args).items() if v is not None}))
+

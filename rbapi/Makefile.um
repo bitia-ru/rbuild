@@ -1,0 +1,8 @@
+project(rbapi)
+
+set(SRC main.c json.c)
+
+add_executable(${PROJECT_NAME} ${SRC})
+
+target_compile_options(${PROJECT_NAME} C_STANDARD GNU99)
+
